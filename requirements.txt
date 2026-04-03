@@ -1,0 +1,5 @@
+# 二维码扫描器依赖包
+qreader>=3.0.0
+opencv-python>=4.5.0
+pdf2image>=1.16.0
+Pillow>=8.0.0
