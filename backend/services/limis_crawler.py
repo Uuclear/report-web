@@ -1,15 +1,38 @@
 """
 limis爬虫服务 - 从二维码URL爬取检测报告信息
-支持：微信 UA / 桌面 Chrome UA、正则兜底、URL 中的 rNo 回填报告编号
+策略与根目录 qrcode_crawler.py 对齐：
+1) requests + 微信 UA + br 压缩（与历史可用脚本一致）
+2) aiohttp 多 UA 重试
+3) 正则全文兜底
+4) 可选 Selenium：页面由 JS 渲染时静态 HTML 无表格内容
 """
 import re
 import asyncio
+import time
 import aiohttp
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 from urllib.parse import urlparse, parse_qs
 from bs4 import BeautifulSoup
 
 from config import LIMIS_TIMEOUT, LIMIS_RETRY_TIMES
+
+try:
+    import requests
+except ImportError:
+    requests = None  # type: ignore
+
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
+    from webdriver_manager.chrome import ChromeDriverManager
+
+    _SELENIUM_OK = True
+except ImportError:
+    _SELENIUM_OK = False
 
 
 class LimisCrawlerService:
@@ -137,6 +160,29 @@ class LimisCrawlerService:
                 out = out[len(sep) :].strip()
         return out if out else "无"
 
+    def _trim_dom_value(self, value: str, field_name: str) -> str:
+        """DOM 取到的值：只做轻量截断，避免误杀成「无」（与 qrcode_crawler 行为一致）。"""
+        if not value:
+            return "无"
+        v = value.strip()
+        if len(v) > 80:
+            v = self._clean_trailing_labels(v, field_name)
+        return v if v else "无"
+
+    def _regex_should_skip(self, key: str, cur_s: str) -> bool:
+        """当前值已可信则跳过正则；否则继续用全文正则修补。"""
+        if not cur_s or cur_s in ("无", "未知"):
+            return False
+        if self._too_long_or_mixed(cur_s, key):
+            return False
+        if len(cur_s) > 400:
+            return False
+        # 短串里混进多个其它字段名 → 仍重跑正则
+        hits = sum(1 for m in self._OTHER_LABEL_MARKERS if m != key and m in cur_s)
+        if hits >= 2:
+            return False
+        return True
+
     def enrich_from_regex(self, html: str, soup: BeautifulSoup, data: Dict) -> None:
         """DOM 解析失败时，从全文用正则兜底"""
         try:
@@ -169,7 +215,8 @@ class LimisCrawlerService:
         for key, pat in patterns:
             cur = data.get(key)
             cur_s = "" if cur is None else str(cur).strip()
-            if cur_s and cur_s not in ("无", "未知") and not self._too_long_or_mixed(cur_s, key):
+            # 已有「像样」的值则跳过；疑似串字段 / 过长仍用正则覆盖
+            if self._regex_should_skip(key, cur_s):
                 continue
             m = re.search(pat, text_one)
             if m:
@@ -212,10 +259,14 @@ class LimisCrawlerService:
         return data
 
     def extract_field_value(self, soup: BeautifulSoup, field_name: str) -> str:
+        """
+        与 qrcode_crawler.QRCodeCrawler.extract_field_value 同思路：
+        先找标签文本节点 → 相邻兄弟格 → 再同一节点内 split。
+        不再把「略长」误判为无；清理交给 _trim_dom_value + enrich_from_regex。
+        """
         if field_name == "委托日期/抽样日期":
             field_elem = soup.find(string=re.compile(r"委托日期\s*/\s*抽样日期|委托日期|抽样日期"))
         elif field_name == "签发日期":
-            # 页面上常见「报告日期」与签发日期同义
             field_elem = soup.find(string=re.compile(r"签发日期|报告日期"))
         else:
             field_elem = soup.find(string=re.compile(re.escape(field_name)))
@@ -224,56 +275,169 @@ class LimisCrawlerService:
             return "无"
 
         parent = field_elem.parent
-        if parent:
-            next_elem = parent.find_next_sibling()
-            if next_elem:
-                value = next_elem.get_text(strip=True)
-                if value:
-                    value = self._clean_trailing_labels(value, field_name)
-                    if self._too_long_or_mixed(value, field_name):
-                        return "无"
-                    return value
+        if not parent:
+            return "无"
 
-            text = parent.get_text(strip=True)
-            if field_name == "签发日期" and ("签发日期" in text or "报告日期" in text):
-                for split_lab in ("签发日期", "报告日期"):
-                    if split_lab not in text:
-                        continue
-                    parts = re.split(re.escape(split_lab), text, maxsplit=1)
-                    if len(parts) > 1:
-                        value = parts[-1].strip()
-                        if value.startswith("：") or value.startswith(":"):
-                            value = value[1:].strip()
-                        value = self._clean_trailing_labels(value, field_name)
-                        if self._too_long_or_mixed(value, field_name):
-                            return "无"
-                        return value if value else "无"
-            elif field_name in text or (
-                field_name == "委托日期/抽样日期" and ("委托日期" in text or "抽样日期" in text)
-            ):
-                parts = re.split(re.escape(field_name), text, maxsplit=1)
+        next_elem = parent.find_next_sibling()
+        if next_elem:
+            value = next_elem.get_text(strip=True)
+            if value:
+                return self._trim_dom_value(value, field_name)
+
+        text = parent.get_text(strip=True)
+        if field_name == "签发日期" and ("签发日期" in text or "报告日期" in text):
+            for split_lab in ("签发日期", "报告日期"):
+                if split_lab not in text:
+                    continue
+                parts = text.split(split_lab, 1)
                 if len(parts) > 1:
                     value = parts[-1].strip()
                     if value.startswith("：") or value.startswith(":"):
                         value = value[1:].strip()
-                    value = self._clean_trailing_labels(value, field_name)
-                    if self._too_long_or_mixed(value, field_name):
-                        return "无"
-                    return value if value else "无"
+                    return self._trim_dom_value(value, field_name) if value else "无"
+
+        if field_name in text or (
+            field_name == "委托日期/抽样日期" and ("委托日期" in text or "抽样日期" in text)
+        ):
+            parts = text.split(field_name, 1)
+            if len(parts) > 1:
+                value = parts[-1].strip()
+                if value.startswith("：") or value.startswith(":"):
+                    value = value[1:].strip()
+                return self._trim_dom_value(value, field_name) if value else "无"
 
         return "无"
+
+    def _apply_pipeline(self, html: str, report_no_url: str) -> Dict:
+        """解析 HTML → 字典（含正则兜底）。"""
+        soup = BeautifulSoup(html, "html.parser")
+        data = self.parse_report_page(soup)
+        self.enrich_from_url(data, report_no_url)
+        self.enrich_from_regex(html, soup, data)
+        return data
+
+    def _fetch_html_requests(self, url: str) -> Optional[str]:
+        """与历史 qrcode_crawler 一致：requests + 微信 UA；优先带 br，失败则退回 gzip/deflate。"""
+        if requests is None:
+            return None
+        header_variants = (
+            {**self.WECHAT_HEADERS, "Accept-Encoding": "gzip, deflate, br"},
+            {**self.WECHAT_HEADERS, "Accept-Encoding": "gzip, deflate"},
+        )
+        for hdr in header_variants:
+            try:
+                r = requests.get(url, headers=hdr, timeout=self.timeout)
+                r.raise_for_status()
+                if not r.encoding or r.encoding == "ISO-8859-1":
+                    r.encoding = r.apparent_encoding or "utf-8"
+                text = r.text
+                if len(text) >= 100:
+                    return text
+            except Exception as e:
+                print(f"[LIMIS] requests 获取失败 ({hdr.get('Accept-Encoding')}): {e}")
+        return None
+
+    def _extract_download_url_selenium(self, driver, original_url: str) -> str:
+        """从页面 JS 变量取真实 PDF 下载地址（与 qrcode_crawler 一致）。"""
+        try:
+            js_vars = driver.execute_script(
+                """
+                return {
+                    testingReportId: typeof testingReportId !== 'undefined' ? testingReportId : null,
+                    testingReportNo: typeof testingReportNo !== 'undefined' ? testingReportNo : null
+                };
+                """
+            )
+            r_id = js_vars.get("testingReportId")
+            r_no = js_vars.get("testingReportNo")
+            if r_id and r_no:
+                api_result = driver.execute_script(
+                    """
+                    return new Promise((resolve) => {
+                        var xhr = new XMLHttpRequest();
+                        xhr.open('POST', '/WeChat/GetReportUrl', true);
+                        xhr.setRequestHeader('Content-Type', 'application/json');
+                        xhr.onreadystatechange = function() {
+                            if (xhr.readyState === 4) {
+                                if (xhr.status === 200) {
+                                    try { resolve(JSON.parse(xhr.responseText)); }
+                                    catch(e) { resolve({}); }
+                                } else resolve({error: xhr.status});
+                            }
+                        };
+                        xhr.send(JSON.stringify({
+                            testingReportId: testingReportId,
+                            testingReportNo: testingReportNo
+                        }));
+                    });
+                    """
+                )
+                if api_result and api_result.get("state") == 1 and api_result.get("url"):
+                    return api_result.get("url")
+            parsed = urlparse(original_url)
+            params = parse_qs(parsed.query)
+            url_r_id = params.get("rId", [""])[0]
+            url_r_no = params.get("rNo", [""])[0]
+            if url_r_id and url_r_no:
+                return (
+                    f"https://zy.jktac.com/WeChat/SMSDownload?"
+                    f"rId={url_r_id}&rNo={url_r_no}"
+                )
+        except Exception:
+            pass
+        return ""
+
+    def _crawl_selenium(self, url: str) -> Tuple[Dict, bool]:
+        """无头 Chrome 拉取渲染后 DOM（Limis 多为前端渲染）。"""
+        if not _SELENIUM_OK:
+            return {}, False
+        data: Dict = {}
+        try:
+            options = Options()
+            options.add_argument("--headless")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument(f'--user-agent={self.WECHAT_HEADERS["User-Agent"]}')
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+            try:
+                driver.get(url)
+                WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                time.sleep(3)
+                dl = self._extract_download_url_selenium(driver, url)
+                html = driver.page_source
+                report_no_url = self.extract_report_no(url)
+                data = self._apply_pipeline(html, report_no_url)
+                if dl:
+                    data["报告下载链接"] = dl
+                ok = self._has_valid_data(data)
+                return data, ok
+            finally:
+                driver.quit()
+        except Exception as e:
+            print(f"[LIMIS] Selenium 失败: {e}")
+            return {}, False
 
     async def crawl_url(self, url: str) -> Tuple[Dict, bool]:
         report_no_url = self.extract_report_no(url)
         data: Dict = {}
         last_html = ""
-        success = False
 
+        # ① 与历史脚本一致：requests + br（静态页/编码更稳）
+        html_rq = await asyncio.to_thread(self._fetch_html_requests, url)
+        if html_rq:
+            last_html = html_rq
+            data = self._apply_pipeline(html_rq, report_no_url)
+            if self._has_valid_data(data):
+                print("[LIMIS] 爬取成功 mode=requests")
+                return data, True
+
+        # ② aiohttp 多 UA
         header_sets = [
             ("wechat", self.WECHAT_HEADERS),
             ("desktop", self.DESKTOP_HEADERS),
         ]
-
         timeout = aiohttp.ClientTimeout(total=self.timeout)
 
         for hname, headers in header_sets:
@@ -293,15 +457,10 @@ class LimisCrawlerService:
                                 await asyncio.sleep(0.6)
                                 continue
 
-                            soup = BeautifulSoup(last_html, "html.parser")
-                            data = self.parse_report_page(soup)
-                            self.enrich_from_url(data, report_no_url)
-                            self.enrich_from_regex(last_html, soup, data)
-
+                            data = self._apply_pipeline(last_html, report_no_url)
                             if self._has_valid_data(data):
-                                success = True
-                                print(f"[LIMIS] 爬取成功 ua={hname} attempt={attempt + 1}")
-                                return data, success
+                                print(f"[LIMIS] 爬取成功 mode=aiohttp ua={hname} attempt={attempt + 1}")
+                                return data, True
 
                             print(
                                 f"[LIMIS] {hname} 解析无有效字段，重试 "
@@ -314,20 +473,28 @@ class LimisCrawlerService:
 
                 await asyncio.sleep(0.8)
 
-        # 最后一轮：用最后一次 HTML 再合并一次
+        # ③ 用最后一次 HTML 再跑一遍管道
         if last_html:
-            soup = BeautifulSoup(last_html, "html.parser")
-            if not data:
-                data = self.parse_report_page(soup)
-            self.enrich_from_url(data, report_no_url)
-            self.enrich_from_regex(last_html, soup, data)
-            success = self._has_valid_data(data)
-            if not success and report_no_url:
-                # 至少保证有报告编号，便于前端展示 / 走 AI 时有编号
-                data.setdefault("报告编号", report_no_url)
-                data.setdefault("status", "未知")
-                success = True
-                print("[LIMIS] 仅保留 URL 中报告编号，页面字段未完全解析")
+            data = self._apply_pipeline(last_html, report_no_url)
+
+        # ④ JS 渲染页面：Selenium 取 page_source
+        if not self._has_valid_data(data):
+            print("[LIMIS] 尝试 Selenium 渲染…")
+            data_se, ok_se = await asyncio.to_thread(self._crawl_selenium, url)
+            if ok_se and data_se:
+                print("[LIMIS] 爬取成功 mode=selenium")
+                return data_se, True
+            if data_se and self._has_valid_data(data_se):
+                return data_se, True
+            if data_se:
+                data = data_se
+
+        success = self._has_valid_data(data)
+        if not success and report_no_url:
+            data.setdefault("报告编号", report_no_url)
+            data.setdefault("status", "未知")
+            success = True
+            print("[LIMIS] 仅保留 URL 中报告编号，页面字段未完全解析")
 
         return data, success
 

@@ -35,6 +35,9 @@ def persist_limis_after_crawl(file_path: str, crawl_result: Dict[str, Any]) -> N
     if not report_no:
         return
     url = crawl_result.get("url")
+    # Selenium 可能解析出真实 PDF 下载链，优先于二维码查询 URL
+    dl = (data.get("报告下载链接") or "").strip()
+    report_link = dl if dl.startswith("http") else url
     db = SessionLocal()
     try:
         create_limis_single_page(
@@ -62,7 +65,7 @@ def persist_limis_after_crawl(file_path: str, crawl_result: Dict[str, Any]) -> N
             检测机构=_norm(data.get("检测机构")),
             检验依据=_norm(data.get("检验依据")),
             报告状态=_norm(data.get("status")),
-            报告下载链接=url,
+            报告下载链接=report_link,
             本地PDF路径=file_path,
         )
     finally:
