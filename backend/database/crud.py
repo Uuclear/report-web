@@ -398,6 +398,11 @@ def scetia_to_dict(r: ScetiaReport) -> dict:
         SCETIA_QUERY_URL = "http://www.scetia.com/Scetia.OnlineExplorer/App_Public/AntiFakeReportQuery.aspx"
 
     enc = quote(r.报告编号 or "", safe="")
+    # 构建带参数的查询链接（预填报告编号）
+    query_url = SCETIA_QUERY_URL
+    if r.报告编号:
+        query_url = f"{SCETIA_QUERY_URL}?rqstConsignID={quote(r.报告编号)}"
+    
     return {
         "id": r.id,
         "报告编号": r.报告编号,
@@ -424,6 +429,6 @@ def scetia_to_dict(r: ScetiaReport) -> dict:
         "防伪码": r.防伪码,
         "本地PDF路径": r.本地PDF路径,
         "pdf_download_path": f"/api/files/scetia/{enc}/download",
-        "query_portal_url": SCETIA_QUERY_URL,
+        "query_portal_url": query_url,
         "created_at": r.created_at.isoformat() if r.created_at else None,
     }

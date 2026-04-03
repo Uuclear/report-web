@@ -15,6 +15,13 @@ except ImportError:
     print("警告: pdf2image未安装，PDF处理功能受限")
 
 try:
+    from PIL import Image
+    PIL_SUPPORT = True
+except ImportError:
+    PIL_SUPPORT = False
+    print("警告: PIL未安装，图片转PDF功能受限")
+
+try:
     import PyPDF2
     PYPDF2_SUPPORT = True
 except ImportError:
@@ -158,3 +165,79 @@ class PDFProcessorService:
                 return 'multi_pdf'
         
         return 'unknown'
+    
+    def images_to_pdf(self, image_paths: List[str], output_pdf_path: str) -> bool:
+        """
+        将多个图片合并为一个PDF文件
+        
+        Args:
+            image_paths: 图片路径列表（按顺序）
+            output_pdf_path: 输出PDF路径
+            
+        Returns:
+            是否成功
+        """
+        if not PIL_SUPPORT or not image_paths:
+            return False
+        
+        try:
+            images = []
+            first_mode = None
+            
+            for img_path in image_paths:
+                if not os.path.exists(img_path):
+                    continue
+                img = Image.open(img_path)
+                # 转换为RGB模式（PDF不支持RGBA）
+                if img.mode in ('RGBA', 'P'):
+                    img = img.convert('RGB')
+                elif img.mode != 'RGB':
+                    img = img.convert('RGB')
+                images.append(img)
+            
+            if not images:
+                return False
+            
+            # 保存为PDF
+            first_img = images[0]
+            remaining_imgs = images[1:] if len(images) > 1 else []
+            first_img.save(output_pdf_path, 'PDF', save_all=True, append_images=remaining_imgs)
+            
+            return True
+        
+        except Exception as e:
+            print(f"图片转PDF失败: {e}")
+            return False
+    
+    def image_to_pdf(self, image_path: str, output_pdf_path: str = None) -> str:
+        """
+        将单个图片转换为PDF
+        
+        Args:
+            image_path: 图片路径
+            output_pdf_path: 输出PDF路径（可选，默认同目录同名.pdf）
+            
+        Returns:
+            生成的PDF路径，失败返回None
+        """
+        if not PIL_SUPPORT:
+            return None
+        
+        if not os.path.exists(image_path):
+            return None
+        
+        if output_pdf_path is None:
+            output_pdf_path = str(Path(image_path).with_suffix('.pdf'))
+        
+        if self.images_to_pdf([image_path], output_pdf_path):
+            return output_pdf_path
+        return None
+
+
+# 提供一个全局实例和便捷函数
+pdf_processor = PDFProcessorService()
+
+
+def convert_image_to_pdf(image_path: str, output_pdf_path: str = None) -> str:
+    """便捷函数：将图片转换为PDF"""
+    return pdf_processor.image_to_pdf(image_path, output_pdf_path)
